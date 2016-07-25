@@ -3,12 +3,15 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedLists           #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE PatternSynonyms           #-}
+{-# LANGUAGE TemplateHaskell           #-}
 {-# LANGUAGE ViewPatterns              #-}
 
-module Damn (damnPackets, damnRespond, prettyDamn) where
+module Damn (damnPackets, damnRespond, prettyDamn, ChatState(..)) where
 
 import           ClientState
 import           Control.Arrow                (left, second)
+import           Control.Lens
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Log
@@ -17,6 +20,7 @@ import           Control.Monad.State
 import           Control.Monad.Trans
 import qualified Data.ByteString              as SB
 import qualified Data.ByteString.Lazy         as B
+import qualified Data.ByteString.UTF8         as SB (fromString)
 import qualified Data.HashMap.Strict          as H
 import           Data.IORef
 import           Data.List
@@ -31,13 +35,30 @@ import           Data.Text.Internal.Builder   (toLazyText)
 import qualified Data.Text.Lazy               as LT
 import           Data.Text.Lazy.Encoding
 import qualified Data.Text.Read               as R
-import           Debug.Trace
 import           HTMLEntities.Decoder
 import           Network.IRC.Base
 import           Prelude
 import           Text.Damn.Packet
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
 import qualified Text.PrettyPrint.ANSI.Leijen as P ((<$>))
+
+data User = User
+          { userName      :: T.Text
+          , userPrivclass :: T.Text
+          , userSymbol    :: T.Text
+          , joinCount     :: Integer
+          } deriving Show
+
+data ChatState = ChatState
+               { _privclasses :: H.HashMap T.Text (H.HashMap T.Text Integer)
+               , _users       :: H.HashMap T.Text (H.HashMap T.Text User)
+               }
+
+instance Monoid ChatState where
+    mempty = ChatState mempty mempty
+    mappend (ChatState a1 a2) (ChatState b1 b2) = ChatState (a1 <> b1) (a2 <> b2)
+
+makeLenses ''ChatState
 
 damnPackets h = construct $ do
     b <- liftIO $ B.hGetContents h
@@ -47,7 +68,7 @@ damnPackets h = construct $ do
                               , B.tail -> tail'
                               ))
             | B.null head' = stop
-            | m <- parse (LT.toStrict $ decodeUtf8 $ stripNewlines head') =
+            | m <- parse (LT.toStrict $ decodeLatin1 $ stripNewlines head') =
                 yield (left ((,) head') m) >> go tail'
         stripNewlines b | "\n" `B.isSuffixOf` b = stripNewlines (B.init b)
                         | otherwise = b
@@ -60,9 +81,19 @@ damnRespond = forever $ do
             logMessage $ dullmagenta ">>>" <+> prettyDamn d
             H.lookupDefault (const stop) (pktCommand d) respondMap d
 
+pattern Subpacket pkt <- ((>>= parse') -> Just pkt)
+
+dc2Irc (T.encodeUtf8 -> chat)
+    | "chat:" `SB.isPrefixOf` chat = pure $ "#" <> SB.drop 5 chat
+    | "pchat:" `SB.isPrefixOf` chat
+    , [_, u1, u2] <- SB.split 58 chat = do
+        nick <- asks clientNick
+        pure $ "&" <> (if nick == u1 then u2 else u1)
+
 respondMap = [ ("dAmnServer", c_dAmnServer)
              , ("login", c_login)
              , ("join", c_join)
+             , ("recv", c_recv)
              , ("property", c_property)
              , ("ping", \ _ -> sendServer $ Packet "pong" Nothing [] Nothing)
              ]
@@ -86,62 +117,103 @@ c_login (Packet _ _ args _)
 c_join (Packet _ (Just param) args _)
     | Just "ok" <- M.lookup "e" args = do
         nick <- asks clientNick
-        sendClient $ Message (Just (NickName nick Nothing Nothing)) "JOIN" ["#" <> T.encodeUtf8 (T.drop 5 param)]
+        room <- dc2Irc param
+        sendClient $ Message (mkNickName nick) "JOIN" [room]
 
 c_property (Packet _ (Just param) args body)
     | Just "topic" <- M.lookup "p" args
     , Just ts <- M.lookup "ts" args
     , Just setter <- M.lookup "by" args = do
         nick <- asks clientNick
-        sendClient $ serverMessage "332" [ nick
-                                         , "#" <> T.encodeUtf8 (T.drop 5 param)
-                                         , maybe "" decodeEntities body
-                                         ]
-        sendClient $ serverMessage "333" [ nick
-                                         , "#" <> T.encodeUtf8 (T.drop 5 param)
+        room <- dc2Irc param
+        sendClient $ serverMessage "332" [ nick, room, maybe "" decodeEntities body ]
+        sendClient $ serverMessage "333" [ nick, room
                                          , T.encodeUtf8 setter <> "@chat.deviantart.com"
                                          , T.encodeUtf8 ts
                                          ]
 
-    | Just "members" <- M.lookup "p" args
-    , Just body' <- body = do
-        Just pcs <- H.lookup param <$> get
-        let users = nub $ mapMaybe (toUser pcs) $ subpacketList body'
+    | Just "members" <- M.lookup "p" args = do
+        Just pcs <- use (privclasses . at param)
+        room <- dc2Irc param
+        us' <- (users . at param) <?= userListToMap (mapMaybe (toUser pcs) $ subpacketList body)
+        logMessage $ string $ show us'
         nick <- asks clientNick
-        logMessage $ string $ show pcs
         sendClient $ serverMessage "353" [ nick
                                          , "="
-                                         , "#" <> T.encodeUtf8 (T.drop 5 param)
-                                         , SB.intercalate " " users
+                                         , room
+                                         , T.encodeUtf8 $ T.intercalate " " $ map (\ u -> userSymbol u <> userName u) $ H.elems us'
                                          ]
-        sendClient $ serverMessage "366" [ nick
-                                         , "#" <> T.encodeUtf8 (T.drop 5 param)
-                                         , "End of /NAMES list."
-                                         ]
+        sendClient $ serverMessage "366" [ nick, room, "End of /NAMES list." ]
 
     | Just "privclasses" <- M.lookup "p" args
-    , Just body' <- body = modify (H.insert param $ parsePrivclasses body')
+    , Just body' <- body = privclasses . at param ?= H.fromList (parsePrivclasses body')
 
     | otherwise = return ()
     where
-        decodeEntities = T.encodeUtf8 . LT.toStrict . toLazyText . htmlEncodedText
-        subpacketList body = case parse' body of
-            Just pkt@(Packet _ _ _ body)
-                | Just body' <- body -> pkt : subpacketList body'
-                | otherwise -> [pkt]
-            Nothing -> []
+        subpacketList (Subpacket pkt@(Packet _ _ _ body)) = pkt : subpacketList body
+        subpacketList _ = []
         toUser pcs (Packet _ param args _) = do
-            uname <- T.encodeUtf8 <$> param
+            uname <- param
             pcname <- M.lookup "pc" args
-            pclevel <- lookup pcname pcs
-            return $ pcToSymbol pclevel <> uname
-        pcToSymbol n | n >= 90 = "~"
-                     | n >= 75 = "@"
-                     | n >= 50 = "+"
-                     | otherwise = ""
+            pclevel <- H.lookup pcname pcs
+            return $ User uname pcname (pcToSymbol pclevel) 1
+        userListToMap = foldr (\ u -> H.insertWith incJoinCount (userName u) u) mempty
+        incJoinCount (User _ _ _ j1) (User a b c j2) = User a b c (j1 + j2)
         parsePrivclasses = mapMaybe (readInt . second T.tail . T.breakOn ":") . T.lines
         readInt (R.decimal -> Right (i, ""), x) = Just (x, i)
         readInt _ = Nothing
+
+decodeEntities = T.encodeUtf8 . LT.toStrict . toLazyText . htmlEncodedText
+
+pcToSymbol n | n >= 99 = "~"
+             | n >= 75 = "@"
+             | n >= 50 = "+"
+             | otherwise = ""
+
+c_recv msg@(Packet _ (Just param) _ (Subpacket (Packet "msg" _ args (Just body))))
+    | Just from <- M.lookup "from" args = do
+        room <- dc2Irc param
+        nick <- asks clientNick
+        when (T.encodeUtf8 from /= nick) $
+            sendClient $ Message (mkNickNameText from) "PRIVMSG" [room, decodeEntities body]
+
+c_recv msg@(Packet _ (Just param) _ (Subpacket (Packet "action" _ args (Just body))))
+    | Just from <- M.lookup "from" args = do
+        room <- dc2Irc param
+        nick <- asks clientNick
+        when (T.encodeUtf8 from /= nick) $
+            sendClient $ Message (mkNickNameText from) "PRIVMSG" [room, "\1ACTION " <> decodeEntities body <> "\1"]
+
+c_recv msg@(Packet _ (Just param) _ body')
+    | Subpacket (Packet "join" (Just uname) args _) <- T.replace "\n\n" "\n" <$> body'
+    , Just pc <- M.lookup "pc" args = do
+        Just pclevel <- preuse (privclasses . ix param . ix pc)
+        existingUser <- preuse (users . ix param . ix uname)
+        let newUser = User uname pc (pcToSymbol pclevel) newJc
+            newJc = maybe 1 (succ . joinCount) existingUser
+        room <- dc2Irc param
+        users . ix param %= H.insert uname newUser
+        when (newJc == 1) $
+            sendClient $ Message (mkNickNameText uname) "JOIN" [room]
+        unless (newJc == 1) $
+            sendClient $ channelNotice room $
+                T.encodeUtf8 uname <> " has joined again, now joined "
+                                   <> SB.fromString (show newJc)
+                                   <> " time(s)"
+
+c_recv msg@(Packet _ (Just param) _ (Subpacket (Packet "part" (Just uname) args _)))
+    | Just reason <- M.lookup "r" args = do
+        Just existingUser <- preuse (users . ix param . ix uname)
+        let newJc = pred (joinCount existingUser)
+        room <- dc2Irc param
+        when (newJc == 0) $ do
+            sendClient $ Message (mkNickNameText uname) "PART" [room, T.encodeUtf8 reason]
+            users . ix param %= H.delete uname
+        unless (newJc == 0) $
+            sendClient $ channelNotice room $
+                T.encodeUtf8 uname <> " has left, now joined "
+                                   <> SB.fromString (show newJc)
+                                   <> " time(s)"
 
 prettyDamn (Packet cmd prm args body) =
     appendBody body $ appendArgs args $ textToDoc cmd <> showParam prm

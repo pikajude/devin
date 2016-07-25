@@ -3,8 +3,10 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedLists           #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE PatternSynonyms           #-}
 {-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
+{-# LANGUAGE ViewPatterns              #-}
 
 module Irc where
 
@@ -24,9 +26,11 @@ import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.Resource
 import           Damn                               hiding (respondMap)
 import           Data.ByteString                    as SB (ByteString, elem)
+import qualified Data.ByteString                    as SB hiding (splitAt)
 import qualified Data.ByteString.UTF8               as SB
 import qualified Data.HashMap.Strict                as H
 import           Data.IORef
+import           Data.List                          (sort)
 import           Data.Machine
 import           Data.Monoid
 import qualified Data.Set                           as S
@@ -42,6 +46,8 @@ import           Paths_devin
 import           System.IO
 import           Text.Damn.Packet
 import           Text.PrettyPrint.ANSI.Leijen       hiding ((<>))
+
+pattern Action t <- (SB.splitAt 8 -> ("\1ACTION ", SB.init -> t))
 
 prettyIrc (Message pre cmd prms) =
     showPre pre $ showCmd cmd <+> showParams prms
@@ -89,7 +95,7 @@ respond = construct $ fix (\ f st -> do
                                  , joinQueue = jref
                                  }
 
-                damnTid <- fork $ (`evalStateT` H.empty) $ (`runReaderT` aE) $ do
+                damnTid <- fork $ (`evalStateT` mempty) $ (`runReaderT` aE) $ do
                     runT_ $ damnPackets h ~> construct damnRespond
                     logMessage $ dullgreen "!!!" <+> "disconnected from dAmn"
 
@@ -137,14 +143,24 @@ setupMap = [ ("NICK", c_nick)
            -- , ("JOIN", c_prejoin)
            ]
 
+irc2dc channel
+    | "#" `SB.isPrefixOf` channel = pure $ "chat:" <> decodeUtf8 (SB.tail channel)
+    | "&" `SB.isPrefixOf` channel = do
+        nick <- asks clientNick
+        pure $ decodeUtf8 $ "pchat:" <> SB.intercalate ":" (sort [nick, SB.tail channel])
+
 respondMap :: (MonadIO m, HasClientEnv c, MonadReader c m)
            => H.HashMap Command (Message -> ReaderT AuthEnv (PlanT (k (Either a Message)) o m) ())
 respondMap = [ ("CAP" , c_cap)
              , ("MODE", c_mode)
              , ("PING", c_ping)
              , ("JOIN", c_join)
+             , ("PART", c_part)
              , ("QUIT", \ _ -> lift stop)
 
+             , ("PRIVMSG", c_privmsg)
+
+             , ("WHO", const noop)
              , ("NICK", const noop)
              , ("USER", const noop)
              , ("PASS", const noop)
@@ -163,13 +179,26 @@ c_mode _ = noop
 
 c_ping (Message _ _ args) = sendClient $ serverMessage "PONG" $ args ++ args
 
-c_join (Message _ _ rooms) = do
+c_join (Message _ _ [SB.split 44 -> rooms']) = do
     lin <- asks loggedIn >>= liftIO . readIORef
+    rooms <- mapM irc2dc rooms'
     if lin
         then forM_ rooms joinChannel
         else do
             jq <- asks joinQueue
             liftIO $ modifyIORef' jq (<> S.fromList rooms)
+
+c_part (Message _ _ [SB.split 44 -> rooms]) = forM_ rooms $ \ room -> do
+    d <- irc2dc room
+    sendServer $ Packet "part" (Just d) [] Nothing
+
+c_privmsg (Message _ _ [channel, Action msg]) = do
+    room <- irc2dc channel
+    sendServer $ Packet "send" (Just room) [] (Just $ "action main\n\n" <> decodeUtf8 msg)
+
+c_privmsg (Message _ _ [channel, msg]) = do
+    room <- irc2dc channel
+    sendServer $ Packet "send" (Just room) [] (Just $ "msg main\n\n" <> decodeUtf8 msg)
 
 greet n p = do
     host <- asks (serverHost . getClientEnv)

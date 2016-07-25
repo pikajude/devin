@@ -15,6 +15,7 @@ import qualified Data.ByteString.UTF8   as SB
 import           Data.IORef
 import           Data.Monoid
 import           Data.Set
+import           Data.Text              (Text)
 import           Data.Text.Encoding
 import           Data.Time
 import           Network.IRC.Base
@@ -32,7 +33,7 @@ data AuthEnv = AuthEnv
              , clientAuth :: ByteString
              , damnChan   :: TChan Packet
              , loggedIn   :: IORef Bool
-             , joinQueue  :: IORef (Set ByteString)
+             , joinQueue  :: IORef (Set Text)
              }
 
 data ClientState = ClientState
@@ -60,12 +61,12 @@ serverMessage :: Command -> [Parameter] -> Message
 serverMessage = Message (Just (Server "chat.deviantart.com"))
 
 noticeMessage :: ByteString -> Message
-noticeMessage x = serverMessage "NOTICE" ["*", x]
+noticeMessage = channelNotice "*"
 
-joinChannel :: (MonadReader AuthEnv m, MonadIO m) => ByteString -> m ()
-joinChannel room = case SB.uncons room of
-    Just ('#', rmname) -> sendServer $
-        Packet "join" (Just $ "chat:" <> decodeUtf8 rmname) [] Nothing
-    Just ('&', username) -> sendClient $ noticeMessage "Pchats not implemented yet"
-    Just _ -> sendClient $ serverMessage "403" [room, "Invalid channel name"]
-    Nothing -> error "how did we get here?"
+channelNotice r x = serverMessage "NOTICE" [r, x]
+
+mkNickName x = Just $ NickName x (Just x) (Just "chat.deviantart.com")
+mkNickNameText = mkNickName . encodeUtf8
+
+-- joinChannel :: (MonadReader AuthEnv m, MonadIO m) => ByteString -> m ()
+joinChannel room = sendServer $ Packet "join" (Just room) [] Nothing

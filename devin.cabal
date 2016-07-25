@@ -28,6 +28,7 @@ executable devin
                      , hostname
                      , html-entities
                      , irc
+                     , ixset-typed
                      , lens
                      , lifted-base
                      , logging-effect

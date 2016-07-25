@@ -12,7 +12,8 @@ module Irc where
 
 import           ClientState
 import           Control.Category                   (Category)
-import           Control.Concurrent.Lifted          hiding (writeChan)
+import           Control.Concurrent.Async.Lifted
+import           Control.Concurrent.Lifted          hiding (writeChan, yield)
 import           Control.Concurrent.STM
 import           Control.Exception.Safe
 import           Control.Lens
@@ -27,6 +28,7 @@ import           Control.Monad.Trans.Resource
 import           Damn                               hiding (respondMap)
 import           Data.ByteString                    as SB (ByteString, elem)
 import qualified Data.ByteString                    as SB hiding (splitAt)
+import qualified Data.ByteString.Lazy               as LB
 import qualified Data.ByteString.UTF8               as SB
 import qualified Data.HashMap.Strict                as H
 import           Data.IORef
@@ -43,6 +45,7 @@ import           LogInstances
 import           Network
 import           Network.IRC.Base                   hiding (render)
 import           Paths_devin
+import           System.Exit
 import           System.IO
 import           Text.Damn.Packet
 import           Text.PrettyPrint.ANSI.Leijen       hiding ((<>))
@@ -61,78 +64,36 @@ prettyIrc (Message pre cmd prms) =
         showCmd = dullblue . bsToDoc
         bsToDoc = string . SB.toString
 
-respond :: ( Category k, MonadIO m, MonadLog Doc m, MonadCatch m
-           , HasClientEnv env, MonadReader env m, MonadBaseControl IO m
-           , MonadResource m, GetLogHandler Doc m)
-        => MachineT m (k (Either (String, a) Message)) o
-respond = construct $ fix (\ f st -> do
-    st'@(ClientState n a) <- execStateT (processOne setupMap =<< lift await) st
+respond ircChan = fix (\ f st -> do
+    st'@(ClientState n a) <- execStateT (runT_ $ construct nextPacket ~> construct (processOne setupMap)) st
     case (n, a) of
         (Just n', Just a') -> do
             greet n' a'
             c <- asks getClientEnv
-            (hKey, authEnv) <- lift $ do
-                ch <- liftIO newTChanIO
-                (hKey, h) <- allocate (connectTo "chat.deviantart.com" (PortNumber 3900)) hClose
 
-                logHandler <- fmap (\ hndl -> hndl . (dullgreen "!!!" <+>)) getLogHandler
+            fix $ \ g -> do
+                (authEnv, damnThread) <- initClientInstance c n' a'
+                myThread <- async $ (`runReaderT` authEnv) $ do
+                    handshake
+                    runT_ $ repeatedly nextPacket ~> repeatedly (processOne respondMap)
 
-                liftIO $ hSetBuffering h NoBuffering
+                ended <- waitEitherCancel damnThread myThread
+                case ended of
+                    Left () -> g
+                    Right () -> return ()
 
-                writerTid <- fork $ forever $ do
-                    pkt <- liftIO $ atomically $ readTChan ch
-                    liftIO $ T.hPutStr h (render pkt <> "\n\0")
-                    logMessage $ dullyellow "<<<" <+> prettyDamn pkt
-
-                lref <- liftIO $ newIORef False
-                jref <- liftIO $ newIORef mempty
-
-                let aE = AuthEnv { clientEnv = c
-                                 , clientNick = n'
-                                 , clientAuth = a'
-                                 , damnChan = ch
-                                 , loggedIn = lref
-                                 , joinQueue = jref
-                                 }
-
-                damnTid <- fork $ (`evalStateT` mempty) $ (`runReaderT` aE) $ do
-                    runT_ $ damnPackets h ~> construct damnRespond
-                    logMessage $ dullgreen "!!!" <+> "disconnected from dAmn"
-
-                register $ do
-                    killThread writerTid
-                    logHandler $ "stopped writing to dAmn" <+> parens (string (show writerTid))
-                register $ do
-                    killThread damnTid
-                    logHandler $ "stopped reading from dAmn" <+> parens (string (show damnTid))
-
-                return (hKey, aE)
-
-            (`runReaderT` authEnv) $ do
-                handshake
-                forever $ do
-                    pkt' <- lift await
-                    processOne respondMap pkt'
         _ -> f st') (ClientState Nothing Nothing)
--- respond = construct $ fix (\ f st -> do
---     st'@(ClientState n a) <- execStateT (processOne setupMap =<< lift await) st
---     case (n, a) of
---         (Just n', Just a') -> do
---             greet n' a'
---             (h, chan) <- lift connectToDamn
---             c <- ask
---             (`runReaderT` AuthEnv c chan) $ do
---                 handshake
---                 forever $ do
---                     pkt' <- lift await
---                     processOne respondMap pkt'
---         _ -> f st') (ClientState Nothing Nothing)
+    where
+        nextPacket :: forall m k. MonadIO m => PlanT k (Either (String, LB.ByteString) Message) m ()
+        nextPacket = yield =<< liftIO (readChan ircChan)
 
-processOne rMap pkt' = case pkt' of
-    Left (x, _) -> sendClient $ noticeMessage (SB.fromString x)
-    Right pkt -> do
-        logMessage $ dullgreen "<<<" <+> prettyIrc pkt
-        H.lookupDefault (const $ lift stop) (msg_command pkt) rMap pkt
+processOne rMap = do
+    pkt' <- await
+    case pkt' of
+        Left (x, _) -> sendClient $ noticeMessage (SB.fromString x)
+        Right pkt -> do
+            logMessage $ dullgreen "<<<" <+> prettyIrc pkt
+            H.lookupDefault (const stop) (msg_command pkt) rMap pkt
 
 noop = return ()
 
@@ -149,18 +110,18 @@ irc2dc channel
         nick <- asks clientNick
         pure $ decodeUtf8 $ "pchat:" <> SB.intercalate ":" (sort [nick, SB.tail channel])
 
-respondMap :: (MonadIO m, HasClientEnv c, MonadReader c m)
-           => H.HashMap Command (Message -> ReaderT AuthEnv (PlanT (k (Either a Message)) o m) ())
+-- respondMap :: (MonadIO m, HasClientEnv c, MonadReader c m, MonadLog Doc m)
+--            => H.HashMap Command (Message -> ReaderT AuthEnv (PlanT (k (Either a Message)) o m) ())
 respondMap = [ ("CAP" , c_cap)
              , ("MODE", c_mode)
              , ("PING", c_ping)
              , ("JOIN", c_join)
              , ("PART", c_part)
-             , ("QUIT", \ _ -> lift stop)
+             , ("QUIT", const stop)
 
              , ("PRIVMSG", c_privmsg)
+             , ("WHO", c_who)
 
-             , ("WHO", const noop)
              , ("NICK", const noop)
              , ("USER", const noop)
              , ("PASS", const noop)
@@ -174,7 +135,14 @@ c_nick (Message _ _ [n]) = nick ?= n
 
 c_pass (Message _ _ [password]) = authtoken ?= password
 
-c_mode :: Monad m => t -> m ()
+c_mode (Message _ _ [channel]) = do
+    nick <- asks clientNick
+    sendClient $ serverMessage "324" [nick, channel, "+i"]
+
+c_mode (Message _ _ [channel, "b"]) = do
+    nick <- asks clientNick
+    sendClient $ serverMessage "368" [nick, channel, "End of channel ban list."]
+
 c_mode _ = noop
 
 c_ping (Message _ _ args) = sendClient $ serverMessage "PONG" $ args ++ args
@@ -199,6 +167,10 @@ c_privmsg (Message _ _ [channel, Action msg]) = do
 c_privmsg (Message _ _ [channel, msg]) = do
     room <- irc2dc channel
     sendServer $ Packet "send" (Just room) [] (Just $ "msg main\n\n" <> decodeUtf8 msg)
+
+c_who (Message _ _ [channel]) = do
+    room <- irc2dc channel
+    sendDamnResponder $ WHO room
 
 greet n p = do
     host <- asks (serverHost . getClientEnv)

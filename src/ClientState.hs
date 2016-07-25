@@ -5,35 +5,40 @@
 
 module ClientState where
 
-import           Control.Concurrent.STM
+import           Control.Concurrent.Chan
 import           Control.Lens
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 import           Control.Monad.State
 import           Data.ByteString
-import qualified Data.ByteString.UTF8   as SB
+import qualified Data.ByteString.Lazy    as LB
+import qualified Data.ByteString.UTF8    as SB
 import           Data.IORef
 import           Data.Monoid
 import           Data.Set
-import           Data.Text              (Text)
+import           Data.Text               (Text)
 import           Data.Text.Encoding
 import           Data.Time
 import           Network.IRC.Base
 import           Text.Damn.Packet
 
+data SpecialRequest = WHO Text
+                    deriving Show
+
 data ClientEnv = ClientEnv
-                 { writeChan  :: TChan Message
-                 , serverHost :: String
-                 , startTime  :: UTCTime
+                 { _sendToClient :: Message -> IO ()
+                 , serverHost    :: String
+                 , startTime     :: UTCTime
                  }
 
 data AuthEnv = AuthEnv
-             { clientEnv  :: ClientEnv
-             , clientNick :: ByteString
-             , clientAuth :: ByteString
-             , damnChan   :: TChan Packet
-             , loggedIn   :: IORef Bool
-             , joinQueue  :: IORef (Set Text)
+             { clientEnv        :: ClientEnv
+             , clientNick       :: ByteString
+             , clientAuth       :: ByteString
+             , _sendToDamn      :: Packet -> IO ()
+             , _sendToResponder :: Either SpecialRequest (Either (LB.ByteString, String) Packet) -> IO ()
+             , loggedIn         :: IORef Bool
+             , joinQueue        :: IORef (Set Text)
              }
 
 data ClientState = ClientState
@@ -50,12 +55,16 @@ instance HasClientEnv ClientEnv where getClientEnv = id
 instance HasClientEnv AuthEnv where getClientEnv = clientEnv
 
 sendClient msg = do
-    chan <- asks (writeChan . getClientEnv)
-    liftIO $ atomically $ writeTChan chan msg
+    sender <- asks (_sendToClient . getClientEnv)
+    liftIO $ sender msg
 
 sendServer msg = do
-    chan <- asks damnChan
-    liftIO $ atomically $ writeTChan chan msg
+    sender <- asks _sendToDamn
+    liftIO $ sender msg
+
+sendDamnResponder msg = do
+    sender <- asks _sendToResponder
+    liftIO $ sender (Left msg)
 
 serverMessage :: Command -> [Parameter] -> Message
 serverMessage = Message (Just (Server "chat.deviantart.com"))

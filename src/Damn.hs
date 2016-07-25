@@ -4,48 +4,59 @@
 {-# LANGUAGE OverloadedLists           #-}
 {-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE PatternSynonyms           #-}
+{-# LANGUAGE RecursiveDo               #-}
 {-# LANGUAGE TemplateHaskell           #-}
 {-# LANGUAGE ViewPatterns              #-}
 
-module Damn (damnPackets, damnRespond, prettyDamn, ChatState(..)) where
+module Damn (damnPackets, damnRespond, prettyDamn, ChatState(..), initClientInstance) where
 
 import           ClientState
-import           Control.Arrow                (left, second)
+import           Control.Arrow                   (left, second)
+import           Control.Concurrent.Async.Lifted
+import qualified Control.Concurrent.Chan         as C
+import           Control.Concurrent.Lifted       hiding (yield)
 import           Control.Lens
 import           Control.Monad
+import           Control.Monad.Catch             (finally)
 import           Control.Monad.IO.Class
 import           Control.Monad.Log
 import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans
-import qualified Data.ByteString              as SB
-import qualified Data.ByteString.Lazy         as B
-import qualified Data.ByteString.UTF8         as SB (fromString)
-import qualified Data.HashMap.Strict          as H
+import           Control.Monad.Trans.Resource
+import qualified Data.ByteString                 as SB
+import qualified Data.ByteString.Lazy            as B
+import qualified Data.ByteString.UTF8            as SB (fromString)
+import qualified Data.HashMap.Strict             as H
 import           Data.IORef
 import           Data.List
 import           Data.Machine
-import qualified Data.Map                     as M
+import qualified Data.Map                        as M
 import           Data.Maybe
 import           Data.Monoid
-import qualified Data.Set                     as S
-import qualified Data.Text                    as T
-import qualified Data.Text.Encoding           as T
-import           Data.Text.Internal.Builder   (toLazyText)
-import qualified Data.Text.Lazy               as LT
+import qualified Data.Set                        as S
+import qualified Data.Text                       as T
+import qualified Data.Text.Encoding              as T
+import           Data.Text.Internal.Builder      (toLazyText)
+import qualified Data.Text.IO                    as T
+import qualified Data.Text.Lazy                  as LT
 import           Data.Text.Lazy.Encoding
-import qualified Data.Text.Read               as R
+import qualified Data.Text.Read                  as R
 import           HTMLEntities.Decoder
-import           Network.IRC.Base
+import           LogInstances
+import           Network
+import           Network.IRC.Base                hiding (render)
 import           Prelude
+import           System.IO
 import           Text.Damn.Packet
-import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
-import qualified Text.PrettyPrint.ANSI.Leijen as P ((<$>))
+import           Text.PrettyPrint.ANSI.Leijen    hiding ((<$>), (<>))
+import qualified Text.PrettyPrint.ANSI.Leijen    as P ((<$>))
 
 data User = User
           { userName      :: T.Text
           , userPrivclass :: T.Text
           , userSymbol    :: T.Text
+          , userRealName  :: T.Text
           , joinCount     :: Integer
           } deriving Show
 
@@ -60,26 +71,77 @@ instance Monoid ChatState where
 
 makeLenses ''ChatState
 
-damnPackets h = construct $ do
+initClientInstance c n' a' = do
+    logHandler <- fmap (\ hndl -> hndl . (dullgreen "!!!" <+>)) getLogHandler
+
+    (handleKey, handle) <- (`allocate` hClose) $ connectTo "chat.deviantart.com" (PortNumber 3900)
+    liftIO $ hSetBinaryMode handle True
+
+    upstreamChan <- liftIO C.newChan
+    upstreamTid <- fork $ forever $ do
+        pkt <- liftIO $ C.readChan upstreamChan
+        liftIO $ T.hPutStr handle (render pkt <> "\n\0")
+        logMessage $ dullyellow "<<<" <+> prettyDamn pkt
+
+    downstreamChan <- liftIO C.newChan
+    downstreamTid <- fork $ damnPackets handle downstreamChan
+
+    loggedInRef <- liftIO $ newIORef False
+    joinListRef <- liftIO $ newIORef mempty
+
+    let aE = AuthEnv { clientEnv = c
+                     , clientNick = n'
+                     , clientAuth = a'
+                     , _sendToDamn = C.writeChan upstreamChan
+                     , _sendToResponder = C.writeChan downstreamChan
+                     , loggedIn = loggedInRef
+                     , joinQueue = joinListRef
+                     }
+
+    k1 <- register $ do
+        killThread downstreamTid
+        logHandler $ "stopped reading from dAmn" <+> parens (string (show downstreamTid))
+
+    k2 <- register $ do
+        killThread upstreamTid
+        logHandler $ "stopped writing to dAmn" <+> parens (string (show upstreamTid))
+
+    respondThread <- async $ (`evalStateT` mempty) $ (`runReaderT` aE) $
+        do
+            runT_ $ repeatedly (damnMsgs downstreamChan) ~> repeatedly damnRespond
+            logMessage $ dullgreen "!!!" <+> "disconnected from dAmn"
+        `finally` mapM_ release (handleKey : [k1, k2])
+
+    return (aE, respondThread)
+    where
+        damnMsgs ch = liftIO (C.readChan ch) >>= yield
+
+damnPackets h chan = do
     b <- liftIO $ B.hGetContents h
     go b
     where
         go (B.break (== 0) -> ( head'
                               , B.tail -> tail'
                               ))
-            | B.null head' = stop
-            | m <- parse (LT.toStrict $ decodeLatin1 $ stripNewlines head') =
-                yield (left ((,) head') m) >> go tail'
+            | B.null head' = return ()
+            | m <- parse (LT.toStrict $ decodeLatin1 $ stripNewlines head') = do
+                liftIO $ C.writeChan chan (Right (left ((,) head') m))
+                go tail'
         stripNewlines b | "\n" `B.isSuffixOf` b = stripNewlines (B.init b)
                         | otherwise = b
 
-damnRespond = forever $ do
+damnRespond = do
     p <- await
     case p of
-        Left (badInp, s) -> logMessage (dullred "!!!" <+> string s <> ":" <+> string (show badInp))
-        Right d -> do
+        Right (Left (badInp, s)) -> logMessage (dullred "!!!" <+> string s <> ":" <+> string (show badInp))
+
+        Right (Right d) -> do
             logMessage $ dullmagenta ">>>" <+> prettyDamn d
             H.lookupDefault (const stop) (pktCommand d) respondMap d
+
+        Left otherMsg -> handleSpecial otherMsg
+    where
+        handleSpecial w@WHO{} = special_WHO w
 
 pattern Subpacket pkt <- ((>>= parse') -> Just pkt)
 
@@ -155,10 +217,11 @@ c_property (Packet _ (Just param) args body)
         toUser pcs (Packet _ param args _) = do
             uname <- param
             pcname <- M.lookup "pc" args
+            rn <- M.lookup "realname" args
             pclevel <- H.lookup pcname pcs
-            return $ User uname pcname (pcToSymbol pclevel) 1
+            return $ User uname pcname (pcToSymbol pclevel) rn 1
         userListToMap = foldr (\ u -> H.insertWith incJoinCount (userName u) u) mempty
-        incJoinCount (User _ _ _ j1) (User a b c j2) = User a b c (j1 + j2)
+        incJoinCount (User _ _ _ _ j1) (User a b c d j2) = User a b c d (j1 + j2)
         parsePrivclasses = mapMaybe (readInt . second T.tail . T.breakOn ":") . T.lines
         readInt (R.decimal -> Right (i, ""), x) = Just (x, i)
         readInt _ = Nothing
@@ -186,10 +249,11 @@ c_recv msg@(Packet _ (Just param) _ (Subpacket (Packet "action" _ args (Just bod
 
 c_recv msg@(Packet _ (Just param) _ body')
     | Subpacket (Packet "join" (Just uname) args _) <- T.replace "\n\n" "\n" <$> body'
-    , Just pc <- M.lookup "pc" args = do
+    , Just pc <- M.lookup "pc" args
+    , Just rn <- M.lookup "realname" args = do
         Just pclevel <- preuse (privclasses . ix param . ix pc)
         existingUser <- preuse (users . ix param . ix uname)
-        let newUser = User uname pc (pcToSymbol pclevel) newJc
+        let newUser = User uname pc (pcToSymbol pclevel) rn newJc
             newJc = maybe 1 (succ . joinCount) existingUser
         room <- dc2Irc param
         users . ix param %= H.insert uname newUser
@@ -227,3 +291,19 @@ prettyDamn (Packet cmd prm args body) =
         argToDoc (k,a) = textToDoc k <> "=" <> dullblue (textToDoc a)
         appendBody Nothing doc = doc
         appendBody (Just body) doc = align (vsep [doc, empty, textToDoc body])
+
+special_WHO (WHO room) = do
+    list <- preuse (users . ix room)
+    channel <- dc2Irc room
+    nick <- asks clientNick
+    forM_ list $ \ x -> do
+        forM_ (H.toList x) $ \ (uname, user) ->
+            sendClient $ serverMessage "352" [nick, channel
+                                             , T.encodeUtf8 uname
+                                             , "chat.deviantart.com"
+                                             , "chat.deviantart.com"
+                                             , T.encodeUtf8 uname
+                                             , "H"
+                                             , "0 " <> decodeEntities (userRealName user)
+                                             ]
+        sendClient $ serverMessage "315" [nick, channel, "End of /WHO list."]

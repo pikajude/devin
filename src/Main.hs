@@ -7,7 +7,7 @@
 module Main where
 
 import           ClientState
-import           Control.Concurrent.Lifted    hiding (writeChan, yield)
+import           Control.Concurrent.Lifted    hiding (yield)
 import           Control.Concurrent.STM
 import           Control.Monad
 import           Control.Monad.Catch
@@ -31,31 +31,31 @@ import           Text.PrettyPrint.ANSI.Leijen as PP hiding ((<>))
 import           Irc
 import           LogInstances
 
-packets :: MonadIO m => Handle -> MachineT m k (Either (String, B.ByteString) Message)
-packets h = construct $ do
+-- packets :: MonadIO m => Handle -> MachineT m k (Either (String, B.ByteString) Message)
+packets h ch = do
     b <- liftIO $ B.hGetContents h
     go b
     where
         go (B.break (== 10) -> ( head'
                                , B.tail -> tail' -- chop off the '\n'
                                ))
-            | B.null head' = stop
-            | Just m <- decode (B.toStrict head') = yield (Right m) >> go tail'
-            | otherwise = yield (Left ("Unrecognized message", head')) >> go tail'
+            | B.null head' = return ()
+            | Just m <- decode (B.toStrict head') = writeChan ch (Right m) >> go tail'
+            | otherwise = writeChan ch (Left ("Unrecognized message", head')) >> go tail'
 
 runOneClient :: ( MonadBaseControl IO m, MonadIO m, MonadLog Doc m, MonadCatch m, MonadResource m
-                , GetLogHandler Doc m)
+                , GetLogHandler Doc m, MonadMask m)
              => String -> UTCTime -> (Handle, t, t1) -> m ()
 runOneClient host time (clientH, _, _) = do
     liftIO $ hSetBinaryMode clientH True
-    chan <- liftIO newTChanIO
-    let cEnv = ClientEnv { writeChan = chan
+    chan <- liftIO newChan
+    let cEnv = ClientEnv { _sendToClient = writeChan chan
                          , serverHost = host
                          , startTime = time
                          }
 
     clientWriter <- fork $ forever $ do
-        m <- liftIO $ atomically $ readTChan chan
+        m <- liftIO $ readChan chan
         liftIO $ SB.hPut clientH $ encode m <> "\r\n"
         logMessage $ prettyIrc m
 
@@ -63,14 +63,20 @@ runOneClient host time (clientH, _, _) = do
 
     let initState = ClientState Nothing Nothing
 
+    ch <- liftIO newChan
+    otherTid <- fork $ packets clientH ch
+
     register $ do
         killThread clientWriter
         logHandler $ "stopped writing to handle" <+> parens (string (show clientWriter))
     register $ do
         hClose clientH
         logHandler $ "closed client handle" <+> parens (string (show clientH))
+    register $ do
+        killThread otherTid
+        logHandler $ "stopped reading from client" <+> parens (string (show otherTid))
 
-    (`runReaderT` cEnv) $ runT_ $ packets clientH ~> respond
+    (`runReaderT` cEnv) $ respond ch
 
 main :: IO ()
 main = do

@@ -11,49 +11,48 @@
 module Irc where
 
 import           ClientState
-import           Control.Category                   (Category)
+import           Control.Category                (Category)
 import           Control.Concurrent.Async.Lifted
-import           Control.Concurrent.Lifted          hiding (writeChan, yield)
+import           Control.Concurrent.Lifted       hiding (writeChan, yield)
 import           Control.Concurrent.STM
 import           Control.Exception.Safe
 import           Control.Lens
 import           Control.Monad
-import qualified Control.Monad.Ether.Implicit.State as E
 import           Control.Monad.IO.Class
 import           Control.Monad.Log
 import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.Resource
-import           Damn                               hiding (respondMap)
-import           Data.ByteString                    as SB (ByteString, elem)
-import qualified Data.ByteString                    as SB hiding (splitAt)
-import qualified Data.ByteString.Lazy               as LB
-import qualified Data.ByteString.UTF8               as SB
-import qualified Data.HashMap.Strict                as H
+import           Damn                            hiding (respondMap)
+import           Data.ByteString                 as SB (ByteString, elem)
+import qualified Data.ByteString                 as SB hiding (splitAt)
+import qualified Data.ByteString.Lazy            as LB
+import qualified Data.ByteString.UTF8            as SB
+import qualified Data.HashMap.Strict             as H
 import           Data.IORef
-import           Data.List                          (sort)
+import           Data.List                       (sort)
 import           Data.Machine
 import           Data.Monoid
-import qualified Data.Set                           as S
-import qualified Data.Text                          as T
+import qualified Data.Set                        as S
+import qualified Data.Text                       as T
 import           Data.Text.Encoding
-import qualified Data.Text.IO                       as T
+import qualified Data.Text.IO                    as T
 import           Data.Time
 import           Data.Version
 import           LogInstances
 import           Network
-import           Network.IRC.Base                   hiding (render)
+import qualified Network.Damn                    as Damn
+import           Network.IRC.Base                hiding (render)
 import           Paths_devin
 import           System.Exit
 import           System.IO
-import           Text.Damn.Packet
-import           Text.PrettyPrint.ANSI.Leijen       hiding ((<>))
+import           Text.PrettyPrint.ANSI.Leijen    hiding ((<>))
 
 pattern Action t <- (SB.splitAt 8 -> ("\1ACTION ", SB.init -> t))
 
-prettyIrc (Message pre cmd prms) =
-    showPre pre $ showCmd cmd <+> showParams prms
+prettyIrc m@(Message pre cmd prms) =
+    showPre pre (showCmd cmd <+> showParams prms)
     where
         showPre (Just s) = (<+>) (dullmagenta (":" <> string (SB.toString $ showPrefix s)))
         showPre Nothing = id
@@ -79,7 +78,7 @@ respond ircChan = fix (\ f st -> do
 
                 ended <- waitEitherCancel damnThread myThread
                 case ended of
-                    Left () -> g
+                    Left ()  -> g
                     Right () -> return ()
 
         _ -> f st') (ClientState Nothing Nothing)
@@ -105,10 +104,10 @@ setupMap = [ ("NICK", c_nick)
            ]
 
 irc2dc channel
-    | "#" `SB.isPrefixOf` channel = pure $ "chat:" <> decodeUtf8 (SB.tail channel)
+    | "#" `SB.isPrefixOf` channel = pure $ "chat:" <> SB.tail channel
     | "&" `SB.isPrefixOf` channel = do
         nick <- asks clientNick
-        pure $ decodeUtf8 $ "pchat:" <> SB.intercalate ":" (sort [nick, SB.tail channel])
+        pure $ "pchat:" <> SB.intercalate ":" (sort [nick, SB.tail channel])
 
 -- respondMap :: (MonadIO m, HasClientEnv c, MonadReader c m, MonadLog Doc m)
 --            => H.HashMap Command (Message -> ReaderT AuthEnv (PlanT (k (Either a Message)) o m) ())
@@ -121,6 +120,7 @@ respondMap = [ ("CAP" , c_cap)
 
              , ("PRIVMSG", c_privmsg)
              , ("WHO", c_who)
+             , ("NAMES", c_names)
 
              , ("NICK", const noop)
              , ("USER", const noop)
@@ -147,7 +147,8 @@ c_mode _ = noop
 
 c_ping (Message _ _ args) = sendClient $ serverMessage "PONG" $ args ++ args
 
-c_join (Message _ _ [SB.split 44 -> rooms']) = do
+c_join (Message _ _ rooms'') = do
+    let rooms' = SB.split 44 . SB.intercalate "," $ filter (not . SB.null) rooms''
     lin <- asks loggedIn >>= liftIO . readIORef
     rooms <- mapM irc2dc rooms'
     if lin
@@ -156,21 +157,29 @@ c_join (Message _ _ [SB.split 44 -> rooms']) = do
             jq <- asks joinQueue
             liftIO $ modifyIORef' jq (<> S.fromList rooms)
 
-c_part (Message _ _ [SB.split 44 -> rooms]) = forM_ rooms $ \ room -> do
+c_part (Message _ _ (room : _)) = do
     d <- irc2dc room
-    sendServer $ Packet "part" (Just d) [] Nothing
+    sendServer $ Damn.Message "part" (Just d) [] Nothing
 
 c_privmsg (Message _ _ [channel, Action msg]) = do
     room <- irc2dc channel
-    sendServer $ Packet "send" (Just room) [] (Just $ "action main\n\n" <> decodeUtf8 msg)
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toMsg $ "action main\n\n" <> msg)
 
 c_privmsg (Message _ _ [channel, msg]) = do
     room <- irc2dc channel
-    sendServer $ Packet "send" (Just room) [] (Just $ "msg main\n\n" <> decodeUtf8 msg)
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toMsg $ "msg main\n\n" <> msg)
 
-c_who (Message _ _ [channel]) = do
-    room <- irc2dc channel
-    sendDamnResponder $ WHO room
+c_who (Message _ _ [channel])
+    | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do
+        room <- irc2dc channel
+        sendDamnResponder $ WHO room
+    | otherwise = noop
+
+c_names (Message _ _ [channel])
+    | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do
+        room <- irc2dc channel
+        sendDamnResponder $ NAMES room
+    | otherwise = noop
 
 greet n p = do
     host <- asks (serverHost . getClientEnv)
@@ -181,8 +190,14 @@ greet n p = do
                                    <> ", running version "
                                    <> SB.fromString (showVersion version)]
     sendClient $ serverMessage "003" [n, "This server was created " <> SB.fromString (fmtTime t)]
-    sendClient $ serverMessage "004" [n, SB.fromString host, "devin-" <> SB.fromString (showVersion version), "i", "s", "I"]
-    sendClient $ serverMessage "005" [n, "CHANTYPES=#&", "PREFIX=(qov)~@+", "are supported by this server"]
+    sendClient $ serverMessage "004" [n, SB.fromString host, "devin-" <> SB.fromString (showVersion version)
+                                     , "DOQRSZaghilopswz"
+                                     , "CFILMPQSbcefgijklmnopqrstvz"
+                                     , "bkloveqjfI"
+                                     ]
+    sendClient $ serverMessage "005" [n, "CHANTYPES=#", "EXCEPTS", "INVEX", "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstz", "CHANLIMIT=#:120", "PREFIX=(qov)~@+", "MAXLIST=bqeI:100", "MODES=4", "NETWORK=freenode", "KNOCK", "STATUSMSG=@+", "CALLERID=g", "are supported by this server"]
+    sendClient $ serverMessage "005" [n, "CASEMAPPING=rfc1459", "CHARSET=ascii", "NICKLEN=16", "CHANNELLEN=50", "TOPICLEN=390", "ETRACE", "CPRIVMSG", "CNOTICE", "DEAF=D", "MONITOR=100", "FNC", "TARGMAX=NAMES:1,LIST:1,KICK:1,WHOIS:1,PRIVMSG:4,NOTICE:4,ACCEPT:,MONITOR:", "are supported by this server"]
+    sendClient $ serverMessage "005" [n, "EXTBAN=$,ajrxz", "WHOX", "CLIENTVER=3.0", "SAFELIST", "ELIST=CTU", "are supported by this server"]
     sendClient $ serverMessage "375" [n, "- devin Message of the Day -"]
     sendClient $ serverMessage "372" [n, "- Welcome to devin, the dAmn IRC proxy."]
     sendClient $ serverMessage "376" [n, "End of /MOTD command."]
@@ -190,4 +205,4 @@ greet n p = do
     where
         fmtTime = formatTime defaultTimeLocale "%a %b %e %Y at %H:%M:%S UTC"
 
-handshake = sendServer $ Packet "dAmnClient" (Just "0.3") [("agent", "devin")] Nothing
+handshake = sendServer $ Damn.Message "dAmnClient" (Just "0.3") [("agent", "devin")] Nothing

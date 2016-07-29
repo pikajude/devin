@@ -19,14 +19,15 @@ import           Data.Set
 import           Data.Text               (Text)
 import           Data.Text.Encoding
 import           Data.Time
-import           Network.IRC.Base
-import           Text.Damn.Packet
+import           Network.Damn            as Damn
+import           Network.IRC.Base        as IRC
 
-data SpecialRequest = WHO Text
+data SpecialRequest = WHO ByteString
+                    | NAMES ByteString
                     deriving Show
 
 data ClientEnv = ClientEnv
-                 { _sendToClient :: Message -> IO ()
+                 { _sendToClient :: IRC.Message -> IO ()
                  , serverHost    :: String
                  , startTime     :: UTCTime
                  }
@@ -35,10 +36,10 @@ data AuthEnv = AuthEnv
              { clientEnv        :: ClientEnv
              , clientNick       :: ByteString
              , clientAuth       :: ByteString
-             , _sendToDamn      :: Packet -> IO ()
-             , _sendToResponder :: Either SpecialRequest (Either (LB.ByteString, String) Packet) -> IO ()
+             , _sendToDamn      :: Damn.Message -> IO ()
+             , _sendToResponder :: Either SpecialRequest (Either (LB.ByteString, String) Damn.Message) -> IO ()
              , loggedIn         :: IORef Bool
-             , joinQueue        :: IORef (Set Text)
+             , joinQueue        :: IORef (Set ByteString)
              }
 
 data ClientState = ClientState
@@ -66,16 +67,18 @@ sendDamnResponder msg = do
     sender <- asks _sendToResponder
     liftIO $ sender (Left msg)
 
-serverMessage :: Command -> [Parameter] -> Message
-serverMessage = Message (Just (Server "chat.deviantart.com"))
+serverMessage :: Command -> [Parameter] -> IRC.Message
+serverMessage = IRC.Message (Just (Server "dAmn"))
 
-noticeMessage :: ByteString -> Message
+serverUserMessage = IRC.Message (mkNickName "dAmn")
+
+noticeMessage :: ByteString -> IRC.Message
 noticeMessage = channelNotice "*"
 
 channelNotice r x = serverMessage "NOTICE" [r, x]
 
-mkNickName x = Just $ NickName x (Just x) (Just "chat.deviantart.com")
+mkNickName x = Just $ NickName x (Just x) (Just "dAmn")
 mkNickNameText = mkNickName . encodeUtf8
 
 -- joinChannel :: (MonadReader AuthEnv m, MonadIO m) => ByteString -> m ()
-joinChannel room = sendServer $ Packet "join" (Just room) [] Nothing
+joinChannel room = sendServer $ Damn.Message "join" (Just room) [] Nothing

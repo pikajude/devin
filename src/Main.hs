@@ -24,7 +24,8 @@ import           Data.Monoid
 import           Data.Time
 import           Network
 import           Network.HostName
-import           Network.IRC
+import           Network.IRC                  (decode)
+import           Network.IRC.Base.Extension
 import           System.IO
 import           Text.PrettyPrint.ANSI.Leijen as PP hiding ((<>))
 
@@ -56,7 +57,7 @@ runOneClient host time (clientH, _, _) = do
 
     clientWriter <- fork $ forever $ do
         m <- liftIO $ readChan chan
-        liftIO $ SB.hPut clientH $ encode m <> "\r\n"
+        liftIO $ SB.hPut clientH $ showMessage m <> "\r\n"
         logMessage $ prettyIrc m
 
     logHandler <- fmap (\ hndl -> hndl . (dullgreen "!!!" <+>)) getLogHandler

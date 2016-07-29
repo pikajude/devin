@@ -1,9 +1,9 @@
 { mkDerivation, ansi-wl-pprint, attoparsec, base, bytestring
-, containers, damnpacket, ether, exceptions, hostname
-, html-entities, irc, ixset-typed, lens, lifted-async, lifted-base
-, logging-effect, machines, monad-control, mtl, network, resourcet
-, safe-exceptions, stdenv, stm, text, time, transformers-base
-, unordered-containers, utf8-string
+, containers, damn, exceptions, hostname, html-entities, irc
+, ixset-typed, lens, lifted-async, lifted-base, logging-effect
+, machines, monad-control, mtl, network, resourcet, safe-exceptions
+, stdenv, stm, text, time, transformers-base, unordered-containers
+, utf8-string
 }:
 mkDerivation {
   pname = "devin";
@@ -12,10 +12,10 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    ansi-wl-pprint attoparsec base bytestring containers damnpacket
-    ether exceptions hostname html-entities irc ixset-typed lens
-    lifted-async lifted-base logging-effect machines monad-control mtl
-    network resourcet safe-exceptions stm text time transformers-base
+    ansi-wl-pprint attoparsec base bytestring containers damn
+    exceptions hostname html-entities irc ixset-typed lens lifted-async
+    lifted-base logging-effect machines monad-control mtl network
+    resourcet safe-exceptions stm text time transformers-base
     unordered-containers utf8-string
   ];
   homepage = "https://github.com/pikajude/devin";

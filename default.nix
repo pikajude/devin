@@ -1,8 +1,8 @@
 { mkDerivation, ansi-wl-pprint, attoparsec, base, bytestring
-, containers, damn, exceptions, hostname, html-entities, irc
-, ixset-typed, lens, lifted-async, lifted-base, logging-effect
-, machines, monad-control, mtl, network, resourcet, safe-exceptions
-, stdenv, stm, text, time, transformers-base, unordered-containers
+, containers, exceptions, hostname, html-entities, irc, ixset-typed
+, lens, lifted-async, lifted-base, logging-effect, machines
+, monad-control, mtl, network, resourcet, safe-exceptions, stdenv
+, stm, text, time, transformers-base, unordered-containers
 , utf8-string
 }:
 mkDerivation {
@@ -12,8 +12,8 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    ansi-wl-pprint attoparsec base bytestring containers damn
-    exceptions hostname html-entities irc ixset-typed lens lifted-async
+    ansi-wl-pprint attoparsec base bytestring containers exceptions
+    hostname html-entities irc ixset-typed lens lifted-async
     lifted-base logging-effect machines monad-control mtl network
     resourcet safe-exceptions stm text time transformers-base
     unordered-containers utf8-string

@@ -1,14 +1,15 @@
 { jude-web ? { outPath = ./.; }
+, config ? {}
 
 , supportedCompilers ? [ "default" "ghc801" ]
 , supportedPlatforms ? [ "x86_64-linux" "i686-linux" "x86_64-darwin" ]
 }:
 
-{ build = let inherit ((import <nixpkgs> {}).lib) genAttrs; in
+{ build = let inherit ((import <nixpkgs> { inherit config; }).lib) genAttrs; in
 
 genAttrs supportedCompilers (compiler:
   genAttrs supportedPlatforms (system:
-    with import <nixpkgs> { inherit system; };
+    with import <nixpkgs> { inherit config system; };
 
     let
       haskellPackages = if compiler == "default"

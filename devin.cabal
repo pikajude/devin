@@ -22,7 +22,7 @@ executable devin
                      , attoparsec
                      , bytestring
                      , containers
-                     , damn
+                     -- , damnpacket >= 1
                      , exceptions
                      , hostname
                      , html-entities

@@ -163,11 +163,12 @@ c_part (Message _ _ (room : _)) = do
 
 c_privmsg (Message _ _ [channel, Action msg]) = do
     room <- irc2dc channel
-    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toMsg $ "action main\n\n" <> msg)
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBody $ "action main\n\n" <> msg)
 
 c_privmsg (Message _ _ [channel, msg]) = do
     room <- irc2dc channel
-    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toMsg $ "msg main\n\n" <> msg)
+    liftIO $ print msg
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBody $ "msg main\n\n" <> msg)
 
 c_who (Message _ _ [channel])
     | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do
@@ -191,13 +192,10 @@ greet n p = do
                                    <> SB.fromString (showVersion version)]
     sendClient $ serverMessage "003" [n, "This server was created " <> SB.fromString (fmtTime t)]
     sendClient $ serverMessage "004" [n, SB.fromString host, "devin-" <> SB.fromString (showVersion version)
-                                     , "DOQRSZaghilopswz"
-                                     , "CFILMPQSbcefgijklmnopqrstvz"
-                                     , "bkloveqjfI"
+                                     , "bqov"
+                                     , "ib"
                                      ]
-    sendClient $ serverMessage "005" [n, "CHANTYPES=#", "EXCEPTS", "INVEX", "CHANMODES=eIbq,k,flj,CFLMPQScgimnprstz", "CHANLIMIT=#:120", "PREFIX=(qov)~@+", "MAXLIST=bqeI:100", "MODES=4", "NETWORK=freenode", "KNOCK", "STATUSMSG=@+", "CALLERID=g", "are supported by this server"]
-    sendClient $ serverMessage "005" [n, "CASEMAPPING=rfc1459", "CHARSET=ascii", "NICKLEN=16", "CHANNELLEN=50", "TOPICLEN=390", "ETRACE", "CPRIVMSG", "CNOTICE", "DEAF=D", "MONITOR=100", "FNC", "TARGMAX=NAMES:1,LIST:1,KICK:1,WHOIS:1,PRIVMSG:4,NOTICE:4,ACCEPT:,MONITOR:", "are supported by this server"]
-    sendClient $ serverMessage "005" [n, "EXTBAN=$,ajrxz", "WHOX", "CLIENTVER=3.0", "SAFELIST", "ELIST=CTU", "are supported by this server"]
+    sendClient $ serverMessage "005" [n, "CHANTYPES=#&", "PREFIX=(qov)~@+", "NETWORK=deviantart", "STATUSMSG=@+", "are supported by this server"]
     sendClient $ serverMessage "375" [n, "- devin Message of the Day -"]
     sendClient $ serverMessage "372" [n, "- Welcome to devin, the dAmn IRC proxy."]
     sendClient $ serverMessage "376" [n, "End of /MOTD command."]

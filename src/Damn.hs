@@ -47,7 +47,7 @@ import qualified Data.Text.Read                  as R
 import           LogInstances
 import           Network
 import           Network.Damn
-import           Network.Damn.Tablumps
+import           Network.Damn.Format.IRC
 import qualified Network.IRC.Base                as IRC
 import           Prelude
 import           System.IO
@@ -145,8 +145,8 @@ damnRespond = do
 
         Left otherMsg -> handleSpecial otherMsg
     where
-        handleSpecial w@WHO{}   = special_WHO w
-        handleSpecial n@NAMES{} = special_NAMES n
+        handleSpecial (WHO w)   = special_WHO w
+        handleSpecial (NAMES n) = special_NAMES n
 
 dc2Irc chat
     | "chat:" `SB.isPrefixOf` chat = pure $ "#" <> SB.drop 5 chat
@@ -202,7 +202,8 @@ c_property (Message _ (Just param) args body)
     , Just setter <- lookup "by" args = do
         nick <- asks clientNick
         room <- dc2Irc param
-        sendClient $ serverMessage "332" [ nick, room, maybe "" (T.encodeUtf8 . bodyTextInline) body ]
+        let topicLines = unLines $ maybe "" (bodyWithFormat ircFormat) body
+        sendClient $ serverMessage "332" [ nick, room, SB.intercalate " - " topicLines ]
         sendClient $ serverMessage "333" [ nick, room
                                          , IRC.showPrefix $ fromJust $ mkNickNameText setter
                                          , T.encodeUtf8 ts
@@ -212,7 +213,6 @@ c_property (Message _ (Just param) args body)
         Just pcs <- use (privclasses . at param)
         room <- dc2Irc param
         us' <- (users . at param) <?= userListToMap (mapMaybe (toUser pcs) $ subpacketList body)
-        logMessage $ string $ show us'
         nick <- asks clientNick
         sendClient $ serverMessage "353" [ nick
                                          , "="
@@ -222,11 +222,11 @@ c_property (Message _ (Just param) args body)
         sendClient $ serverMessage "366" [ nick, room, "End of /NAMES list." ]
 
     | Just "privclasses" <- lookup "p" args
-    , Just mb <- body = privclasses . at param ?= H.fromList (parsePrivclasses (bodyTextInline mb))
+    , Just mb <- body = privclasses . at param ?= H.fromList (parsePrivclasses (bodyBytes mb))
 
     | otherwise = return ()
     where
-        subpacketList (Sub pkt@(SubMessage _ _ _ body)) = pkt : subpacketList body
+        subpacketList (SubM pkt@(SubMessage _ _ _ body)) = pkt : subpacketList body
         subpacketList _ = []
         toUser pcs (SubMessage _ param args _) = do
             uname <- param
@@ -236,7 +236,7 @@ c_property (Message _ (Just param) args body)
             return $ User uname pcname (pcToSymbol pclevel) rn 1
         userListToMap = foldr (\ u -> H.insertWith incJoinCount (userName u) u) mempty
         incJoinCount (User _ _ _ _ j1) (User a b c d j2) = User a b c d (j1 + j2)
-        parsePrivclasses = mapMaybe (readInt . second T.tail . T.breakOn ":") . T.lines
+        parsePrivclasses = mapMaybe (readInt . second T.tail . T.breakOn ":") . T.lines . T.decodeLatin1
         readInt (R.decimal -> Right (i, ""), x) = Just (x, i)
         readInt _                               = Nothing
 
@@ -250,26 +250,28 @@ pcToMode n | n >= 99 = "q"
            | n >= 50 = "v"
            | otherwise = ""
 
-c_recv msg@(Message _ (Just param) _ (Sub (SubMessage (Just "msg") _ args (Just body))))
+bodyLines b = unLines $ bodyWithFormat ircFormat b
+
+c_recv msg@(Message _ (Just param) _ (SubM (SubMessage (Just "msg") _ args (Just body))))
     | Just from <- lookup "from" args = do
         room <- dc2Irc param
         nick <- asks clientNick
         when (T.encodeUtf8 from /= nick) $
-            forM_ (bodyText body) $ \ line ->
-                sendClient $ IRC.Message (mkNickNameText from) "PRIVMSG" [room, T.encodeUtf8 line]
+            forM_ (bodyLines body) $ \ line ->
+                sendClient $ IRC.Message (mkNickNameText from) "PRIVMSG" [room, line]
 
-c_recv msg@(Message _ (Just param) _ (Sub (SubMessage (Just "action") _ args (Just body))))
+c_recv msg@(Message _ (Just param) _ (SubM (SubMessage (Just "action") _ args (Just body))))
     | Just from <- lookup "from" args = do
         room <- dc2Irc param
         nick <- asks clientNick
         when (T.encodeUtf8 from /= nick) $ do
-            forM_ (bodyText body) $ \ line ->
+            forM_ (bodyLines body) $ \ line ->
                 sendClient $ IRC.Message (mkNickNameText from) "PRIVMSG"
-                    [room, "\1ACTION " <> T.encodeUtf8 line <> "\1"]
+                    [room, "\1ACTION " <> line <> "\1"]
 
 c_recv msg@(Message _ (Just param) _
-    (Sub (SubMessage (Just "join") (Just uname) args
-        (Sub (SubMessage Nothing Nothing subArgs _)))))
+    (SubM (SubMessage (Just "join") (Just uname) args
+        (SubM (SubMessage Nothing Nothing subArgs _)))))
     | Just pc <- lookup "pc" subArgs
     , Just rn <- lookup "realname" subArgs = do
         nick <- asks clientNick
@@ -290,7 +292,7 @@ c_recv msg@(Message _ (Just param) _
                       <> SB.fromString (show newJc)
                       <> " time(s)"
 
-c_recv msg@(Message _ (Just param) _ (Sub (SubMessage (Just "part") (Just uname) args _)))
+c_recv msg@(Message _ (Just param) _ (SubM (SubMessage (Just "part") (Just uname) args _)))
     | reason <- lookup "r" args = do
         Just existingUser <- preuse (users . ix param . ix uname)
         let newJc = pred (joinCount existingUser)
@@ -306,7 +308,7 @@ c_recv msg@(Message _ (Just param) _ (Sub (SubMessage (Just "part") (Just uname)
                       <> " time(s)"
 
 c_recv (Message _ (Just param) _
-    (Sub (SubMessage (Just "privchg") (Just uname) args _)))
+    (SubM (SubMessage (Just "privchg") (Just uname) args _)))
     | Just pc <- lookup "pc" args
     , Just by <- lookup "by" args = do
         Just existingUser <- preuse (users . ix param . ix uname)
@@ -329,9 +331,9 @@ c_recv (Message _ (Just param) _
         users . ix param %= H.insert uname newUser
 
         sendClient $ channelNotice room $
-            (uname <> " has been made a member of "
+             uname <> " has been made a member of "
                    <> Colors.bold (T.encodeUtf8 newPrivclass)
-                   <> " by " <> T.encodeUtf8 by)
+                   <> " by " <> T.encodeUtf8 by
 
         when (modeline /= "") $
             sendClient $ serverMessage "MODE" $
@@ -349,9 +351,9 @@ prettyDamn (Message cmd prm args body) =
             | otherwise = align (vsep $ doc : map argToDoc args)
         argToDoc (k,a) = bsToDoc k <> "=" <> dullblue (textToDoc a)
         appendBody Nothing doc     = doc
-        appendBody (Just body) doc = align (vsep [doc, empty, textToDoc $ T.decodeUtf8 $ bodyRaw body])
+        appendBody (Just body) doc = align (vsep [doc, empty, string $ show $ bodyBytes body])
 
-special_WHO (WHO room) = do
+special_WHO room = do
     list <- preuse (users . ix room)
     channel <- dc2Irc room
     nick <- asks clientNick
@@ -367,7 +369,7 @@ special_WHO (WHO room) = do
                                              ]
         sendClient $ serverMessage "315" [nick, channel, "End of /WHO list."]
 
-special_NAMES (NAMES param) = do
+special_NAMES param = do
     room <- dc2Irc param
     Just us' <- use (users . at param)
     nick <- asks clientNick

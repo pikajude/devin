@@ -22,7 +22,7 @@ executable devin
                      , attoparsec
                      , bytestring
                      , containers
-                     -- , damnpacket >= 1
+                     , damnpacket >= 1
                      , exceptions
                      , hostname
                      , html-entities
@@ -39,6 +39,7 @@ executable devin
                      , resourcet
                      , safe-exceptions
                      , stm
+                     , template-haskell
                      , text
                      , time
                      , transformers-base

@@ -163,12 +163,11 @@ c_part (Message _ _ (room : _)) = do
 
 c_privmsg (Message _ _ [channel, Action msg]) = do
     room <- irc2dc channel
-    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBody $ "action main\n\n" <> msg)
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBodyText $ "action main\n\n" <> decodeUtf8 msg)
 
 c_privmsg (Message _ _ [channel, msg]) = do
     room <- irc2dc channel
-    liftIO $ print msg
-    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBody $ "msg main\n\n" <> msg)
+    sendServer $ Damn.Message "send" (Just room) [] (Just $ Damn.toBodyText $ "msg main\n\n" <> decodeUtf8 msg)
 
 c_who (Message _ _ [channel])
     | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do

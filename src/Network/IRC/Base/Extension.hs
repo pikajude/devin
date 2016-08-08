@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Network.IRC.Base.Extension where
 
 import           Data.ByteString       (ByteString)
@@ -25,7 +27,7 @@ showParameters :: [Parameter] -> ByteString
 showParameters []     = BS.empty
 showParameters params = BS.intercalate (B8.pack " ") (BS.empty : showp params)
   where showp [p]
-            | B8.elem ' ' p = [bsConsAscii ':' p]
+            | B8.elem ' ' p || BS.take 1 p == ":" = [bsConsAscii ':' p]
             | otherwise = [p]
         showp (p:ps) = p : showp ps
         showp []     = []

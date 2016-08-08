@@ -5,6 +5,13 @@ module Colors where
 
 import Data.Monoid
 
-colorFun c x = "\3" <> c <> x <> "\x0F"
+styleFun c d x = c <> x <> d
 
-bold = colorFun "\2"
+colorFun b = styleFun ("\3" <> b) "\3"
+
+bold = styleFun "\2" "\2"
+
+blue  = colorFun "02"
+green = colorFun "03"
+red   = colorFun "04"
+yellow = colorFun "08"

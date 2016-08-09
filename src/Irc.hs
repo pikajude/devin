@@ -24,7 +24,7 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans.Control
 import           Control.Monad.Trans.Resource
-import           Damn                            hiding (respondMap)
+import qualified Damn
 import           Data.ByteString                 as SB (ByteString, elem)
 import qualified Data.ByteString                 as SB hiding (splitAt)
 import qualified Data.ByteString.Lazy            as LB
@@ -32,9 +32,8 @@ import qualified Data.ByteString.UTF8            as SB
 import qualified Data.HashMap.Strict             as H
 import           Data.IORef
 import           Data.List                       (sort)
-import           Data.Machine
 import           Data.Monoid
-import qualified Data.Set                        as S
+import qualified Data.Set                        as Set
 import qualified Data.Text                       as T
 import           Data.Text.Encoding
 import qualified Data.Text.IO                    as T
@@ -47,7 +46,9 @@ import           Network.IRC.Base                hiding (render)
 import           Paths_devin
 import           System.Exit
 import           System.IO
-import           Text.PrettyPrint.ANSI.Leijen    hiding ((<>))
+import qualified System.IO.Streams               as S
+import qualified System.IO.Streams.Concurrent    as S
+import           Text.PrettyPrint.ANSI.Leijen    hiding ((<$>), (<>))
 
 pattern Action t <- (SB.splitAt 8 -> ("\1ACTION ", SB.init -> t))
 
@@ -63,36 +64,50 @@ prettyIrc m@(Message pre cmd prms) =
         showCmd = dullblue . bsToDoc
         bsToDoc = string . SB.toString
 
-respond ircChan = fix (\ f st -> do
-    st'@(ClientState n a) <- execStateT (runT_ $ construct nextPacket ~> construct (processOne setupMap)) st
+respond :: (MonadIO m, MonadLog Doc m, MonadReader c m, HasClientEnv c, GetLogHandler Doc m)
+        => S.InputStream (Maybe (Either String Message))
+        -> S.OutputStream Message
+        -> ClientEnv
+        -> m ()
+respond ircInputs ircOutput ce = (`fix` AuthEnvPre Nothing Nothing ce) $ \ f st -> do
+    st'@(AuthEnvPre n a _) <- execStateT (mapM_ (`runStep` setupMap) =<< liftIO (join <$> S.read ircInputs)) st
     case (n, a) of
-        (Just n', Just a') -> do
-            greet n' a'
-            c <- asks getClientEnv
+        (Just n', Just a') -> fix $ \ g -> do
+            (damnInputs, damnOutput) <- Damn.initClientInstance
+            generalized <- liftIO $ S.map IRCMessage ircInputs
+            switcher <- liftIO $ S.concurrentMerge [damnInputs, generalized]
 
-            fix $ \ g -> do
-                (authEnv, damnThread) <- initClientInstance c n' a'
-                myThread <- async $ (`runReaderT` authEnv) $ do
-                    handshake
-                    runT_ $ repeatedly nextPacket ~> repeatedly (processOne respondMap)
+            let ae = AuthEnv { clientEnv = ce
+                             , clientNick = n'
+                             , clientAuth = a'
+                             , _joinQueue = []
+                             , _loggedIn = False
+                             , _privclasses = mempty
+                             , _users = mempty
+                             , _serverStream = damnOutput
+                             }
 
-                ended <- waitEitherCancel damnThread myThread
-                case ended of
-                    Left ()  -> g
-                    Right () -> return ()
+            goAgain <- (`evalStateT` ae) $ do
+                greet n' a'
+                handshake
+                fix $ \ h -> do
+                    x <- liftIO $ S.read switcher
+                    case x of
+                        Nothing -> return False
+                        Just (IRCMessage Nothing) -> return False
+                        Just (IRCMessage (Just i)) -> runStep i respondMap >> h
+                        Just (DamnMessage Nothing) -> return True
+                        Just (DamnMessage (Just d)) -> Damn.runStep d >> h
 
-        _ -> f st') (ClientState Nothing Nothing)
-    where
-        nextPacket :: forall m k. MonadIO m => PlanT k (Either (String, LB.ByteString) Message) m ()
-        nextPacket = yield =<< liftIO (readChan ircChan)
+            if goAgain
+                then g
+                else do
+                    liftIO $ S.write Nothing damnOutput
+                    liftIO $ S.write Nothing ircOutput
+        _ -> f st'
 
-processOne rMap = do
-    pkt' <- await
-    case pkt' of
-        Left (x, _) -> sendClient $ noticeMessage (SB.fromString x)
-        Right pkt -> do
-            logMessage $ dullgreen "<<<" <+> prettyIrc pkt
-            H.lookupDefault (const stop) (msg_command pkt) rMap pkt
+runStep (Left x) rMap = sendClient $ noticeMessage (SB.fromString x)
+runStep (Right pkt) rMap = H.lookupDefault (const $ return ()) (msg_command pkt) rMap pkt
 
 noop = return ()
 
@@ -106,17 +121,16 @@ setupMap = [ ("NICK", c_nick)
 irc2dc channel
     | "#" `SB.isPrefixOf` channel = pure $ "chat:" <> SB.tail channel
     | "&" `SB.isPrefixOf` channel = do
-        nick <- asks clientNick
+        nick <- gets clientNick
         pure $ "pchat:" <> SB.intercalate ":" (sort [nick, SB.tail channel])
 
--- respondMap :: (MonadIO m, HasClientEnv c, MonadReader c m, MonadLog Doc m)
---            => H.HashMap Command (Message -> ReaderT AuthEnv (PlanT (k (Either a Message)) o m) ())
-respondMap = [ ("CAP" , c_cap)
+respondMap = H.fromList
+             [ ("CAP" , c_cap)
              , ("MODE", c_mode)
              , ("PING", c_ping)
              , ("JOIN", c_join)
              , ("PART", c_part)
-             , ("QUIT", const stop)
+             , ("QUIT", \ _ -> return ())
 
              , ("PRIVMSG", c_privmsg)
              , ("WHO", c_who)
@@ -136,11 +150,11 @@ c_nick (Message _ _ [n]) = nick ?= n
 c_pass (Message _ _ [password]) = authtoken ?= password
 
 c_mode (Message _ _ [channel]) = do
-    nick <- asks clientNick
+    nick <- gets clientNick
     sendClient $ serverMessage "324" [nick, channel, "+i"]
 
 c_mode (Message _ _ [channel, "b"]) = do
-    nick <- asks clientNick
+    nick <- gets clientNick
     sendClient $ serverMessage "368" [nick, channel, "End of channel ban list."]
 
 c_mode _ = noop
@@ -149,13 +163,11 @@ c_ping (Message _ _ args) = sendClient $ serverMessage "PONG" $ args ++ args
 
 c_join (Message _ _ rooms'') = do
     let rooms' = SB.split 44 . SB.intercalate "," $ filter (not . SB.null) rooms''
-    lin <- asks loggedIn >>= liftIO . readIORef
+    lin <- use loggedIn
     rooms <- mapM irc2dc rooms'
     if lin
         then forM_ rooms joinChannel
-        else do
-            jq <- asks joinQueue
-            liftIO $ modifyIORef' jq (<> S.fromList rooms)
+        else joinQueue <>= Set.fromList rooms
 
 c_part (Message _ _ (room : _)) = do
     d <- irc2dc room
@@ -172,18 +184,18 @@ c_privmsg (Message _ _ [channel, msg]) = do
 c_who (Message _ _ [channel])
     | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do
         room <- irc2dc channel
-        sendDamnResponder $ WHO room
+        Damn.specialWHO room
     | otherwise = noop
 
 c_names (Message _ _ [channel])
     | "#" `SB.isPrefixOf` channel || "&" `SB.isPrefixOf` channel = do
         room <- irc2dc channel
-        sendDamnResponder $ NAMES room
+        Damn.specialNAMES room
     | otherwise = noop
 
 greet n p = do
-    host <- asks (serverHost . getClientEnv)
-    t <- asks (startTime . getClientEnv)
+    host <- gets (serverHost . getClientEnv)
+    t <- gets (startTime . getClientEnv)
     sendClient $ serverMessage "001" [n, "Hi " <> n <> ", welcome to devin - the dAmn IRC proxy"]
     sendClient $ serverMessage "002" [n, "Your host is "
                                    <> SB.fromString host
@@ -203,3 +215,5 @@ greet n p = do
         fmtTime = formatTime defaultTimeLocale "%a %b %e %Y at %H:%M:%S UTC"
 
 handshake = sendServer $ Damn.Message "dAmnClient" (Just "0.3") [("agent", "devin")] Nothing
+
+{-# ANN module ("HLint: ignore Use camelCase" :: String) #-}

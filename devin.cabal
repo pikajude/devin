@@ -26,13 +26,13 @@ executable devin
                      , exceptions
                      , hostname
                      , html-entities
+                     , io-streams
                      , irc
                      , ixset-typed
                      , lens
                      , lifted-async
                      , lifted-base
                      , logging-effect
-                     , machines
                      , monad-control
                      , mtl
                      , network

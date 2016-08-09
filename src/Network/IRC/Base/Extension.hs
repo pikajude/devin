@@ -21,7 +21,7 @@ bsConsAscii c = BS.cons (fromIntegral . ord $ c)
 showPrefix :: Prefix -> ByteString
 showPrefix (Server s)       = s
 showPrefix (NickName n u h) = BS.concat [n, showMaybe '!' u, showMaybe '@' h]
-  where showMaybe c e = maybe BS.empty (bsConsAscii c) e
+  where showMaybe c = maybe BS.empty (bsConsAscii c)
 
 showParameters :: [Parameter] -> ByteString
 showParameters []     = BS.empty

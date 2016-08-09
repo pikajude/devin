@@ -5,80 +5,97 @@
 
 module ClientState where
 
-import           Control.Concurrent.Chan
 import           Control.Lens
 import           Control.Monad.IO.Class
-import           Control.Monad.Reader
 import           Control.Monad.State
 import           Data.ByteString
-import qualified Data.ByteString.Lazy    as LB
-import qualified Data.ByteString.UTF8    as SB
-import           Data.IORef
-import           Data.Monoid
+import qualified Data.ByteString.UTF8   as SB
+import qualified Data.HashMap.Lazy      as H
 import           Data.Set
-import           Data.Text               (Text)
+import           Data.Text              (Text)
+import qualified Data.Text              as T
 import           Data.Text.Encoding
 import           Data.Time
-import           Network.Damn            as Damn
-import           Network.IRC.Base        as IRC
+import           Network.Damn           as Damn
+import           Network.IRC.Base       as IRC
+import qualified System.IO.Streams      as S
 
 data SpecialRequest = WHO ByteString
                     | NAMES ByteString
                     deriving Show
 
 data ClientEnv = ClientEnv
-                 { _sendToClient :: IRC.Message -> IO ()
+                 { _clientStream :: S.OutputStream IRC.Message
                  , serverHost    :: String
                  , startTime     :: UTCTime
                  }
 
+data AuthEnvPre = AuthEnvPre
+                { _nick        :: Maybe ByteString
+                , _authtoken   :: Maybe ByteString
+                , aepClientEnv :: ClientEnv
+                }
+
 data AuthEnv = AuthEnv
-             { clientEnv        :: ClientEnv
-             , clientNick       :: ByteString
-             , clientAuth       :: ByteString
-             , _sendToDamn      :: Damn.Message -> IO ()
-             , _sendToResponder :: Either SpecialRequest (Either (LB.ByteString, String) Damn.Message) -> IO ()
-             , loggedIn         :: IORef Bool
-             , joinQueue        :: IORef (Set ByteString)
+             { clientEnv    :: ClientEnv
+             , clientNick   :: ByteString
+             , clientAuth   :: ByteString
+             , _joinQueue    :: Set ByteString
+             , _loggedIn     :: Bool
+             , _privclasses :: H.HashMap SB.ByteString (H.HashMap T.Text Integer)
+             , _users       :: H.HashMap SB.ByteString (H.HashMap SB.ByteString User)
+             , _serverStream :: S.OutputStream Damn.Message
              }
 
-data ClientState = ClientState
-                 { _nick      :: Maybe ByteString
-                 , _authtoken :: Maybe ByteString
-                 }
+data User = User
+          { userName      :: SB.ByteString
+          , userPrivclass :: T.Text
+          , userSymbol    :: SB.ByteString
+          , userRealName  :: T.Text
+          , joinCount     :: Integer
+          } deriving Show
 
-makeLenses ''ClientState
+data Event = IRCMessage (Maybe (Either String IRC.Message))
+           | DamnMessage (Maybe (Either String Damn.Message))
+           deriving Show
+
+makeLenses ''AuthEnvPre
+makeLenses ''AuthEnv
 
 class HasClientEnv a where
     getClientEnv :: a -> ClientEnv
 
 instance HasClientEnv ClientEnv where getClientEnv = id
 instance HasClientEnv AuthEnv where getClientEnv = clientEnv
+instance HasClientEnv AuthEnvPre where getClientEnv = aepClientEnv
 
+sendClient :: (HasClientEnv a, MonadIO m, MonadState a m)
+           => IRC.Message -> m ()
 sendClient msg = do
-    sender <- asks (_sendToClient . getClientEnv)
-    liftIO $ sender msg
+    sender <- gets (_clientStream . getClientEnv)
+    liftIO $ S.write (Just msg) sender
 
+sendServer :: (MonadIO m, MonadState AuthEnv m) => Damn.Message -> m ()
 sendServer msg = do
-    sender <- asks _sendToDamn
-    liftIO $ sender msg
-
-sendDamnResponder msg = do
-    sender <- asks _sendToResponder
-    liftIO $ sender (Left msg)
+    sender <- gets _serverStream
+    liftIO $ S.write (Just msg) sender
 
 serverMessage :: Command -> [Parameter] -> IRC.Message
 serverMessage = IRC.Message (Just (Server "dAmn"))
 
+serverUserMessage :: Command -> [Parameter] -> IRC.Message
 serverUserMessage = IRC.Message (mkNickName "dAmn")
 
 noticeMessage :: ByteString -> IRC.Message
 noticeMessage = channelNotice "*"
 
+channelNotice :: ByteString -> ByteString -> IRC.Message
 channelNotice r x = serverMessage "NOTICE" [r, x]
 
+mkNickName :: ByteString -> Maybe Prefix
 mkNickName x = Just $ NickName x (Just x) (Just "dAmn")
+mkNickNameText :: Text -> Maybe Prefix
 mkNickNameText = mkNickName . encodeUtf8
 
--- joinChannel :: (MonadReader AuthEnv m, MonadIO m) => ByteString -> m ()
+joinChannel :: (MonadState AuthEnv m, MonadIO m) => ByteString -> m ()
 joinChannel room = sendServer $ Damn.Message "join" (Just room) [] Nothing

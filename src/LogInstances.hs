@@ -11,10 +11,6 @@ import Control.Monad.Log
 import Control.Monad.Reader
 import Control.Monad.State
 import Control.Monad.Trans.Resource
-import Data.Machine
-
-instance MonadLog msg m => MonadLog msg (PlanT k o m) where
-    logMessage = lift . logMessage
 
 instance MonadLog msg m => MonadLog msg (ReaderT r m) where
     logMessage = lift . logMessage

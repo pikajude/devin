@@ -15,6 +15,7 @@ import           Control.Category                (Category)
 import           Control.Concurrent.Async.Lifted
 import           Control.Concurrent.Lifted       hiding (writeChan, yield)
 import           Control.Concurrent.STM
+import           Control.Concurrent.Thread.Delay (delay)
 import           Control.Exception.Safe
 import           Control.Lens
 import           Control.Monad
@@ -48,6 +49,7 @@ import           System.Exit
 import           System.IO
 import qualified System.IO.Streams               as S
 import qualified System.IO.Streams.Concurrent    as S
+import qualified System.IO.Streams.Core          as S
 import           Text.PrettyPrint.ANSI.Leijen    hiding ((<$>), (<>))
 
 pattern Action t <- (SB.splitAt 8 -> ("\1ACTION ", SB.init -> t))
@@ -64,29 +66,38 @@ prettyIrc m@(Message pre cmd prms) =
         showCmd = dullblue . bsToDoc
         bsToDoc = string . SB.toString
 
-respond :: (MonadIO m, MonadLog Doc m, MonadReader c m, HasClientEnv c, GetLogHandler Doc m)
+respond :: (MonadIO m, MonadLog Doc m, MonadReader c m, HasClientEnv c
+           , GetLogHandler Doc m, MonadCatch m)
         => S.InputStream (Maybe (Either String Message))
         -> S.OutputStream Message
         -> ClientEnv
         -> m ()
 respond ircInputs ircOutput ce = (`fix` AuthEnvPre Nothing Nothing ce) $ \ f st -> do
     st'@(AuthEnvPre n a _) <- execStateT (mapM_ (`runStep` setupMap) =<< liftIO (join <$> S.read ircInputs)) st
+    retried <- liftIO newEmptyMVar
     case (n, a) of
         (Just n', Just a') -> fix $ \ g -> do
-            (damnInputs, damnOutput) <- Damn.initClientInstance
-            generalized <- liftIO $ S.map IRCMessage ircInputs
-            switcher <- liftIO $ S.concurrentMerge [damnInputs, generalized]
+            clientRes <- Damn.initClientInstance
+            case clientRes of
+                Left ioe -> notifyAndWait retried ioe g
+                Right (damnInputs, damnOutput) -> do
+                    generalized <- liftIO $ S.map IRCMessage ircInputs
+                    switcher <- liftIO $ S.concurrentMerge [damnInputs, generalized]
 
-            let ae = AuthEnv { clientEnv = ce
-                             , clientNick = n'
-                             , clientAuth = a'
-                             , _joinQueue = []
-                             , _loggedIn = False
-                             , _privclasses = mempty
-                             , _users = mempty
-                             , _serverStream = damnOutput
-                             }
+                    let ae = AuthEnv { clientEnv = ce
+                                     , clientNick = n'
+                                     , clientAuth = a'
+                                     , _joinQueue = []
+                                     , _loggedIn = False
+                                     , _privclasses = mempty
+                                     , _users = mempty
+                                     , _serverStream = damnOutput
+                                     }
 
+                    clientLoop n' a' ae switcher damnOutput g
+        _ -> f st'
+    where
+        clientLoop n' a' ae switcher damnOutput next = do
             goAgain <- (`evalStateT` ae) $ do
                 greet n' a'
                 handshake
@@ -100,11 +111,25 @@ respond ircInputs ircOutput ce = (`fix` AuthEnvPre Nothing Nothing ce) $ \ f st 
                         Just (DamnMessage (Just d)) -> Damn.runStep d >> h
 
             if goAgain
-                then g
+                then next
                 else do
                     liftIO $ S.write Nothing damnOutput
                     liftIO $ S.write Nothing ircOutput
-        _ -> f st'
+
+        notifyAndWait retriedMV ioe next = do
+            liftIO $ do
+                S.writeTo ircOutput $ Just $ noticeMessage $
+                    "Failed to connect to dAmn! The error was: " <> SB.fromString (show ioe)
+                S.writeTo ircOutput $ Just $ noticeMessage $ SB.fromString
+                    "Waiting 30 seconds before trying again. "
+                firstTry <- isEmptyMVar retriedMV
+                when firstTry $ do
+                    putMVar retriedMV ()
+                    S.writeTo ircOutput $ Just $ noticeMessage $ SB.fromString $
+                        "If the problem persists, dAmn may be down; check the deviantART status page"
+                        ++ " at https://support.deviantart.com/forums/140408-DeviantArt-Status#recent"
+                delay 30000000
+            next
 
 runStep (Left x) rMap = sendClient $ noticeMessage (SB.fromString x)
 runStep (Right pkt) rMap = H.lookupDefault (const $ return ()) (msg_command pkt) rMap pkt

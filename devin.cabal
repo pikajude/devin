@@ -43,6 +43,7 @@ executable devin
                      , text
                      , time
                      , transformers-base
+                     , unbounded-delays
                      , unordered-containers
                      , utf8-string
   hs-source-dirs:      src

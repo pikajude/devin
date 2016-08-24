@@ -13,6 +13,8 @@ import qualified Colors
 import           Control.Arrow                (second)
 import           Control.Lens
 import           Control.Monad
+import           Control.Monad.Catch          (MonadCatch, SomeException,
+                                               tryJust)
 import           Control.Monad.IO.Class
 import           Control.Monad.Log
 import           Control.Monad.State
@@ -35,23 +37,30 @@ import qualified Network.IRC.Base             as IRC
 import           ParserStreams
 import           Prelude
 import           System.IO
+import           System.IO.Error              (isDoesNotExistError)
 import qualified System.IO.Streams            as S
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
 
-initClientInstance :: (GetLogHandler Doc m, MonadIO m)
-                   => m (S.InputStream Event, S.OutputStream Message)
+initClientInstance :: (GetLogHandler Doc m, MonadIO m, MonadCatch m)
+                   => m (Either IOError (S.InputStream Event, S.OutputStream Message))
 initClientInstance = do
     logHandler <- getLogHandler
 
-    handle <- liftIO $ connectTo "chat.deviantart.com" (PortNumber 3900)
-    liftIO $ hSetBinaryMode handle True
+    eitherHandle <- tryJust dnePredicate $ liftIO $ connectTo "chat.deviantart.com" (PortNumber 3900)
+    case eitherHandle of
+        Left e -> return $ Left e
+        Right handle -> do
+            liftIO $ hSetBinaryMode handle True
 
-    (i__, o) <- handleStreams handle messageP render
-        (logHandler . (<+>) (dullyellow "<<<") . prettyDamn)
-        (logHandler . (<+>) (dullmagenta ">>>") . prettyDamn)
-    i_ <- makeExplicitEOF i__
-    i <- liftIO $ S.map DamnMessage i_
-    return (i, o)
+            (i__, o) <- handleStreams handle messageP render
+                (logHandler . (<+>) (dullyellow "<<<") . prettyDamn)
+                (logHandler . (<+>) (dullmagenta ">>>") . prettyDamn)
+            i_ <- makeExplicitEOF i__
+            i <- liftIO $ S.map DamnMessage i_
+            return $ Right (i, o)
+    where
+        dnePredicate x | isDoesNotExistError x = Just x
+                       | otherwise = Nothing
 
 runStep :: (MonadLog Doc m, MonadIO m, MonadState AuthEnv m)
         => Either String Message -> m ()

@@ -34,7 +34,7 @@ import qualified System.IO.Streams            as S
 import           Text.PrettyPrint.ANSI.Leijen as PP hiding ((<$>), (<>))
 
 runOneClient :: (MonadBaseControl IO m, MonadLog Doc m, MonadResource m,
-                 GetLogHandler Doc m)
+                 GetLogHandler Doc m, MonadCatch m)
              => String -> UTCTime -> (Handle, t, t1) -> m ()
 runOneClient host time (clientH, _, _) = do
     liftIO $ hSetBinaryMode clientH True

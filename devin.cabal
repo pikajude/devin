@@ -28,7 +28,6 @@ executable devin
                      , html-entities
                      , io-streams
                      , irc
-                     , ixset-typed
                      , lens
                      , lifted-async
                      , lifted-base

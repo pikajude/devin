@@ -240,6 +240,14 @@ c_recv (Message _ (Just param) _ (SubM (SubMessage (Just "part") (Just uname) ar
                       <> SB.fromString (show newJc)
                       <> " time(s)"
 
+c_recv (Message _ (Just param) _ (SubM (SubMessage (Just "kicked") (Just uname) args reason)))
+    | Just kicker <- lookup "by" args = do
+        Just existingUser <- preuse (users . ix param . ix uname)
+        users . ix param . at uname ?= (existingUser { joinCount = 0 })
+        room <- dc2Irc param
+        let reasonText = SB.concat . unLines . bodyWithFormat ircFormat <$> reason
+        sendClient $ IRC.Message (mkNickName $ T.encodeUtf8 kicker) "KICK" [room, uname, fromMaybe "no reason" reasonText]
+
 c_recv (Message _ (Just param) _
     (SubM (SubMessage (Just "privchg") (Just uname) args _)))
     | Just pc <- lookup "pc" args

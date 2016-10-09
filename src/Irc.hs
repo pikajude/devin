@@ -33,6 +33,7 @@ import qualified Data.ByteString.UTF8            as SB
 import qualified Data.HashMap.Strict             as H
 import           Data.IORef
 import           Data.List                       (sort)
+import           Data.Maybe
 import           Data.Monoid
 import qualified Data.Set                        as Set
 import qualified Data.Text                       as T
@@ -157,6 +158,8 @@ respondMap = H.fromList
              , ("PART", c_part)
              , ("QUIT", \ _ -> return ())
 
+             , ("KICK", c_kick)
+
              , ("PRIVMSG", c_privmsg)
              , ("WHO", c_who)
              , ("NAMES", c_names)
@@ -197,6 +200,11 @@ c_join (Message _ _ rooms'') = do
 c_part (Message _ _ (room : _)) = do
     d <- irc2dc room
     sendServer $ Damn.Message "part" (Just d) [] Nothing
+
+c_kick (Message _ _ (room : user : msg)) = do
+    d <- irc2dc room
+    let reason = listToMaybe msg
+    sendServer $ Damn.Message "kick" (Just d) [("u", decodeUtf8 user)] (Damn.toBodyText . decodeUtf8 <$> reason)
 
 c_privmsg (Message _ _ [channel, Action msg]) = do
     room <- irc2dc channel

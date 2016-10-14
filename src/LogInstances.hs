@@ -9,17 +9,9 @@ module LogInstances where
 
 import Control.Monad.Log
 import Control.Monad.Reader
-import Control.Monad.State
 import Control.Monad.Trans.Resource
 
-instance MonadLog msg m => MonadLog msg (ReaderT r m) where
-    logMessage = lift . logMessage
-
-instance MonadLog msg m => MonadLog msg (StateT r m) where
-    logMessage = lift . logMessage
-
-instance MonadLog msg m => MonadLog msg (ResourceT m) where
-    logMessage = lift . logMessage
+instance MonadLog msg m => MonadLog msg (ResourceT m)
 
 class GetLogHandler message m where
     getLogHandler :: m (Handler IO message)

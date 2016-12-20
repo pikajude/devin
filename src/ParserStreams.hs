@@ -24,9 +24,9 @@ handleStreams h parser render logIn logOut = liftIO $ do
     writer <- S.contramapM_ logOut =<< S.contramap render out_
     return (packets, writer)
     where
-        parseAndPrint s = do
-            t <- liftIO $ S.fromGenerator $ attoparsecGen s parser
-            liftIO $ S.mapM_ (mapM_ logIn) t
+        parseAndPrint s = liftIO $ do
+            t <- S.fromGenerator $ attoparsecGen s parser
+            S.mapM_ (mapM_ logIn) t
 
 makeExplicitEOF :: MonadIO m
                 => S.InputStream a -> m (S.InputStream (Maybe a))

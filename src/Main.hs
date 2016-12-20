@@ -20,6 +20,7 @@ import           Control.Monad.Trans.Resource
 import           Data.Attoparsec.ByteString
 import qualified Data.ByteString              as SB
 import qualified Data.ByteString.Lazy         as B
+import           Data.Foldable                (toList)
 import           Data.Monoid
 import           Data.Time
 import           Irc
@@ -75,4 +76,4 @@ main = do
         withFDHandler options fd ribbonFrac width' =
           withBatchedHandler options
                              (PP.displayIO fd . PP.renderPretty ribbonFrac width'
-                                              . (<> PP.linebreak) . PP.vsep)
+                                              . (<> PP.linebreak) . PP.vsep . toList)

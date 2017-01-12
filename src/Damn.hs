@@ -252,33 +252,35 @@ c_recv (Message _ (Just param) _
     (SubM (SubMessage (Just "privchg") (Just uname) args _)))
     | Just pc <- lookup "pc" args
     , Just by <- lookup "by" args = do
-        Just existingUser <- preuse (users . ix param . ix uname)
-        Just pcs <- use (privclasses . at param)
-
-        let oldPrivclass = userPrivclass existingUser
-            newPrivclass = pc
-            Just oldLevel = H.lookup oldPrivclass pcs
-            Just newLevel = H.lookup newPrivclass pcs
-            newUser = existingUser { userPrivclass = newPrivclass
-                                   , userSymbol = pcToSymbol newLevel
-                                   }
-
-            modeline = (case pcToMode oldLevel of "" -> ""; m -> "-" <> m)
-                    <> (case pcToMode newLevel of "" -> ""; m -> "+" <> m)
-
-            modeArgCount = SB.length modeline `div` 2
-
+        e <- preuse (users . ix param . ix uname)
         room <- dc2Irc param
-        users . ix param %= H.insert uname newUser
+
+        let newPrivclass = pc
+
+        forM_ e $ \ existingUser -> do
+            Just pcs <- use (privclasses . at param)
+
+            let oldPrivclass = userPrivclass existingUser
+                Just oldLevel = H.lookup oldPrivclass pcs
+                Just newLevel = H.lookup newPrivclass pcs
+                newUser = existingUser { userPrivclass = newPrivclass
+                                       , userSymbol = pcToSymbol newLevel
+                                       }
+
+                modeline = (case pcToMode oldLevel of "" -> ""; m -> "-" <> m)
+                        <> (case pcToMode newLevel of "" -> ""; m -> "+" <> m)
+
+                modeArgCount = SB.length modeline `div` 2
+            users . ix param %= H.insert uname newUser
+
+            when (modeline /= "") $
+                sendClient $ serverMessage "MODE" $
+                    [room, modeline] ++ replicate modeArgCount uname
 
         sendClient $ channelNotice room $
              uname <> " has been made a member of "
                    <> Colors.bold (T.encodeUtf8 newPrivclass)
                    <> " by " <> T.encodeUtf8 by
-
-        when (modeline /= "") $
-            sendClient $ serverMessage "MODE" $
-                [room, modeline] ++ replicate modeArgCount uname
 
 c_recv _msg = return ()
 
